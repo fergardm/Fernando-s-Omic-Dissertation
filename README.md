@@ -9,7 +9,7 @@ In this repository, you'll find all the scripts, files and materials needed to r
 + Gene count matrix: the gene count matrix resulting from Python's interface **prepDE.py**, required for RStudio DESeq2 analysis. 
 + pheno_data: a table with all the information (genotype and condition) of each sample, in the same order as the analysis that was taken.
 + Marker genes: three **.txt** files with the marker genes used in this study. They are neccessary for data analysis in RStudio.
-+ R Markdown script: a step by step guide to my *C. reinhardtii* differential expression analysis. It is also available in **.pdf** and **.html**. 
++ DESeq2 analysis R Markdown script: a step by step guide to my *C. reinhardtii* differential expression analysis. It is also available in **.pdf** and **.html**. 
 
 
 ![Workflow followed in this study](https://github.com/fergardm/Fernando-s-Omic-Dissertation/blob/main/Workflow_github.jpg)
