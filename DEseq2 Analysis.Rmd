@@ -1,0 +1,805 @@
+---
+title: "DEseq2 Analysis"
+author: "Fernando Garrido Muñoz"
+date: "21/11/2022"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Install required packages
+
+```{r, eval=FALSE}
+if (!requireNamespace("BiocManager", quietly = TRUE))
+  install.packages("BiocManager")
+BiocManager::install("DESeq2")
+install.packages("pheatmap")
+install.packages("RColorBrewer")
+install.packages("dplyr")
+install.packages("ggplot2")
+BiocManager::install("genefilter")
+BiocManager::install("ashr")
+BiocManager::install("VennDetail")
+install.packages("tidyverse")
+install.packages("kableExtra")
+
+```
+
+# Load required packages
+
+```{r, results='hide', message=FALSE}
+
+library(DESeq2)
+library(RColorBrewer)
+library(dplyr)
+library(ggplot2)
+library(genefilter)
+library(ashr)
+library(VennDetail)
+library(tidyverse)
+library(kableExtra)
+library(pheatmap)
+library(ComplexHeatmap)
+library(circlize)
+
+```
+
+
+
+# Count Matrix Construction
+
+```{r}
+
+pheno.data <- read.csv("pheno_data.csv")
+gene.count.matrix <- read.table(file = "gene_count_matrix.csv",header = T,
+                                sep = ",",row.names = NULL)
+head(gene.count.matrix)
+gene.ids <- sapply(X = strsplit(x = gene.count.matrix$gene_id,split = "\\|"),
+                   FUN = function(x){return(x[1])})
+gene.count.matrix <- gene.count.matrix[,-1]
+
+rownames(gene.count.matrix) = make.names(gene.ids, unique=TRUE)
+head(gene.count.matrix)
+
+```
+
+# Creating DEseq data set object
+
+```{r}
+
+dds <- DESeqDataSetFromMatrix(countData=gene.count.matrix, colData=pheno.data, 
+                              design = ~genotype+ condition +  
+                                genotype:condition)
+dds$genotype
+dds$condition
+dds
+nrow(dds)
+
+# Our experiment consists of 12 samples each with 3 replicates:
+
+dds$sample <- factor(paste0("sample_", rep(c(1,2,3,4,5,6,7,8,9,10,11,12), 
+                                           each=4))
+                     , levels = c("sample_1", "sample_2","sample_3","sample_4",
+                                  "sample_5","sample_6",
+                                  "sample_7","sample_8","sample_9","sample_10",
+                                  "sample_11","sample_12"))
+dds$sample
+dds <- collapseReplicates(dds, dds$sample)
+
+# Only keep counts without 0:
+
+keep <- rowSums(counts(dds) > 1) >=3
+dds <- dds[keep,]
+nrow(dds)
+gene.ids <- rownames(dds)
+
+```
+
+## Set WT and condition 0h as the reference level
+
+```{r}
+
+dds$genotype <- relevel(dds$genotype, ref = "wt")
+dds$condition <- relevel(dds$condition, ref = "0h")
+
+```
+
+# Executing DEseq2
+
+```{r, warning=FALSE, message=FALSE}
+
+dds <- DESeq(dds, minReplicatesForReplace = Inf) 
+resultsNames(dds) 
+
+# Data visualization according to Cooks coefficient
+
+par(mar=c(8,5,2,2))
+boxplot(log10(assays(dds)[["cooks"]]), range=0, las=2, col=rainbow(16)) 
+
+```
+
+# Data previsualization
+
+## Data transformations
+
+Normal logarithm, variance stabilizing and regularized transformations were
+performed in order to visualize data; finally, the variance stabilizing transformation
+was selected.
+
+```{r}
+
+ntd <- normTransform(dds)
+vsd <- vst(dds, blind=FALSE)
+rld <- rlog(dds, blind = FALSE)
+
+df <- bind_rows(as_data_frame(assay(ntd)[, 1:2]) %>% mutate(transformation = "ntd"),
+                as_data_frame(assay(vsd)[, 1:2]) %>% mutate(transformation = "vst"),
+                as_data_frame(assay(rld)[, 1:2]) %>% mutate(transformation = "rlog"))
+
+# Plot exploring every transformation
+
+colnames(df)[1:2] <- c("x", "y")  
+lvls <- c("ntd", "vst", "rlog")
+df$transformation <- factor(df$transformation, levels=lvls)
+ggplot(df, aes(x = x, y = y)) + geom_hex(bins = 80) +
+  coord_fixed() + facet_grid( . ~ transformation) 
+
+```
+
+## Principal Component Analysis
+
+```{r}
+
+pcaData <- plotPCA(vsd, intgroup=c("genotype", "condition"), returnData=TRUE)
+percentVar <- round(100 * attr(pcaData, "percentVar"))
+ggplot(pcaData, aes(PC1, PC2, color=genotype, shape=condition)) +
+  geom_point(size=3) +
+  xlab(paste0("PC1: ",percentVar[1],"% variance")) +
+  ylab(paste0("PC2: ",percentVar[2],"% variance")) + 
+  coord_fixed()
+
+```
+
+## Gene clustering visualization
+
+```{r}
+
+topVarGenes <- head(order(rowVars(assay(vsd)), decreasing = TRUE), 20)
+mat  <- assay(vsd)[ topVarGenes, ]
+mat  <- mat - rowMeans(mat)
+anno <- as.data.frame(colData(vsd)[, c("genotype","condition")])
+pheatmap(mat, annotation_col = anno)
+
+```
+
+# Gene Differential Expression Analysis
+
+Five different contrasts were performed in order to understand the effects of
+cerulenin in *C. reinhardtii* cells. Those were:
+
++ Effect of cerulenin in wild-type (0h vs 4h)
++ Effect of cerulenin in mutant (0h vs 4h)
++ Difference between wild-type and mutant 0h
++ Difference between wild-type and mutant 4h
++ Different response for both genotypes (the interaction term)
+
+## Load some useful markers
+
+```{r}
+
+ATG_markers <- read.table(file = "ATG marker genes .txt",header = T,
+                                sep = "\t",row.names = NULL)
+
+Chloro_stress_markers <- read.table(file = "Chloroplast chaperones and stress marker genes.txt",header =T, 
+                                    sep = "\t",row.names = NULL)
+
+Chloro_redox_markers <- read.table(file = "Choloplast redox marker genes.txt",header = T,
+                                sep = "\t",row.names = NULL)
+```
+
+
+## Effect of cerulenin in wild-type (0h vs 4h)
+
+### Gene obtention
+
+```{r}
+
+resWT = results(dds, contrast=c("condition","4h","0h"), cooksCutoff = FALSE, 
+                independentFiltering = FALSE)
+resWT
+summary(resWT)
+log.fold.change_WT <- resWT$log2FoldChange
+q.value_WT <- resWT$padj
+names(log.fold.change_WT) <- gene.ids
+names(q.value_WT) <- gene.ids
+base.meanWT <- resWT$baseMean
+names(base.meanWT) <- gene.ids
+
+# Take a look at upregulated and downregulated genes: 
+
+top_20_overexpressed_genes_WT <- resWT[order(resWT$log2FoldChange, decreasing = T),]
+kable(top_20_overexpressed_genes_WT[1:20,-(3:4)])
+
+top_20_overrepressed_genes_WT <- resWT[order(resWT$log2FoldChange, decreasing = F),]
+kable(top_20_overrepressed_genes_WT[1:20,-(3:4)])
+
+# Differentialy activated and repressed genes with a log fold change and p-adj threshold of 1.5 and 0.05
+
+activated.genes.deseq2_WT <- gene.ids[log.fold.change_WT > 1 & q.value_WT < 0.05]
+activated.genes.deseq2_WT <- activated.genes.deseq2_WT[!is.na(activated.genes.deseq2_WT)]
+activated.genes.deseq2_WT_good <- substr(activated.genes.deseq2_WT,1,nchar(activated.genes.deseq2_WT)-5)
+write.table(activated.genes.deseq2_WT_good,file="activated.genes.deseq2_WT.txt",sep="\t",quote=F,row.names = F)
+
+repressed.genes.deseq2_WT <- gene.ids[log.fold.change_WT < - 1 & q.value_WT < 0.05]
+repressed.genes.deseq2_WT <- repressed.genes.deseq2_WT[!is.na(repressed.genes.deseq2_WT)]
+repressed.genes.deseq2_WT_good <- substr(repressed.genes.deseq2_WT,1,nchar(repressed.genes.deseq2_WT)-5)
+write.table(repressed.genes.deseq2_WT_good,file="repressed.genes.deseq2_WT.txt",sep="\t",quote=F,row.names = F)
+
+length(activated.genes.deseq2_WT_good)
+length(repressed.genes.deseq2_WT_good)
+
+```
+
+### MA plot 
+
+```{r}
+
+plotMA(resWT,alpha=0.05, ylim=c(-30,30), colSig="grey")
+abline(h=c(-1,1), col="black", lwd=1)
+points(x = base.meanWT[activated.genes.deseq2_WT],
+       y = log.fold.change_WT[activated.genes.deseq2_WT],col="red",cex=0.2,pch=19)
+points(x = base.meanWT[repressed.genes.deseq2_WT],
+       y = log.fold.change_WT[repressed.genes.deseq2_WT],col="blue",cex=0.2,pch=19)
+text(x =100000, y = 15, label = length(activated.genes.deseq2_WT_good),
+     col = "red",   
+     font = 2,      
+     cex = 1.5)     
+text(x =100000, y = -15, label = length(repressed.genes.deseq2_WT_good),
+     col = "blue", 
+     font = 2,     
+     cex = 1.5)    
+
+legend("bottomright", legend = c("Overexpressed", "Repressed"),
+       lwd = 3, col = c("red", "blue"))
+
+```
+
+## Effect of cerulenin in mutant (0h vs 4h)
+
+### Gene obtention
+
+```{r}
+
+res_atg8 <- results(dds, list(c("genotypeatg8.condition4h","condition_4h_vs_0h")),
+                    cooksCutoff = FALSE, independentFiltering = FALSE)
+res_atg8
+
+log.fold.change_atg8 <- res_atg8$log2FoldChange
+q.value_atg8 <- res_atg8$padj
+names(log.fold.change_atg8) <- gene.ids
+names(q.value_atg8) <- gene.ids
+base.mean_atg8 <- res_atg8$baseMean
+names(base.mean_atg8) <- gene.ids
+
+# Take a look at upregulated and downregulated genes: 
+
+top_20_overexpressed_genes_atg8 <- res_atg8[order(res_atg8$log2FoldChange, decreasing = T),]
+kable(top_20_overexpressed_genes_atg8[1:20,-(3:4)])
+
+top_20_overrepressed_genes_atg8 <- res_atg8[order(res_atg8$log2FoldChange, decreasing = F),]
+kable(top_20_overrepressed_genes_atg8[1:20,-(3:4)])
+
+activated.genes.deseq2_atg8 <- gene.ids[log.fold.change_atg8 > 1 & q.value_atg8 < 0.05]
+activated.genes.deseq2_atg8 <- activated.genes.deseq2_atg8[!is.na(activated.genes.deseq2_atg8)]
+activated.genes.deseq2_atg8_good <- substr(activated.genes.deseq2_atg8,1,nchar(activated.genes.deseq2_atg8)-5)
+write.table(activated.genes.deseq2_atg8_good,file="activated.genes.deseq2_atg8.txt",sep="\t",quote=F,row.names = F)
+
+repressed.genes.deseq2_atg8 <- gene.ids[log.fold.change_atg8 < -1 & q.value_atg8 < 0.05]
+repressed.genes.deseq2_atg8 <- repressed.genes.deseq2_atg8[!is.na(repressed.genes.deseq2_atg8)]
+repressed.genes.deseq2_atg8_good <- substr(repressed.genes.deseq2_atg8,1,nchar(repressed.genes.deseq2_atg8)-5)
+write.table(repressed.genes.deseq2_atg8_good,file="repressed.genes.deseq2_atg8.txt",sep="\t",quote=F,row.names = F)
+
+length(activated.genes.deseq2_atg8_good)
+length(repressed.genes.deseq2_atg8_good)
+
+```
+
+### MA plot
+
+```{r}
+
+plotMA(res_atg8,alpha=0.05, ylim=c(-30,30),colSig="grey")
+abline(h=c(-1,1), col="black", lwd=1)
+points(x = base.meanWT[activated.genes.deseq2_atg8],
+       y = log.fold.change_atg8[activated.genes.deseq2_atg8],col="red",cex=0.2,pch=19)
+points(x = base.mean_atg8[repressed.genes.deseq2_atg8],
+       y = log.fold.change_atg8[repressed.genes.deseq2_atg8],col="blue",cex=0.2,pch=19)
+text(x =100000, y = 15, label = length(activated.genes.deseq2_atg8_good),
+     col = "red",   
+     font = 2,      
+     cex = 1.5)     
+text(x =100000, y = -15, label = length(repressed.genes.deseq2_atg8_good),
+     col = "blue",  
+     font = 2,      
+     cex = 1.5)     
+
+legend("bottomright", legend = c("Overexpressed", "Repressed"),
+       lwd = 3, col = c("red", "blue"))
+
+```
+
+## Plotting log2 fold change with target genes for wt and atg8 treated with cerulenin
+
+```{r}
+
+# Test if lists of target genes are in the filtered gene.expression matrix
+
+intersect(ATG_markers$PhyCode, gene.ids) # Check
+intersect(Chloro_stress_markers$PhyCode, gene.ids) # Check
+intersect(Chloro_redox_markers$PhyCode, gene.ids)  # Check
+
+```
+
+### ATG Markers
+
+```{r}
+
+bar.names_ATG <- ATG_markers$Name
+bar.phycodes_ATG <- ATG_markers$PhyCode
+
+wt_treatment_ATG <- as.data.frame(resWT) %>% rownames_to_column("GeneID")
+wt_treatment_ATG <- wt_treatment_ATG[wt_treatment_ATG$GeneID %in% bar.phycodes_ATG,]
+wt_treatment_ATG$GeneID <- ATG_markers$Name[match(wt_treatment_ATG$GeneID,ATG_markers$PhyCode)]
+row.names(wt_treatment_ATG) <- wt_treatment_ATG$GeneID
+wt_treatment_ATG_fold.change <- wt_treatment_ATG[-c(1:2,4:7)]
+colnames(wt_treatment_ATG_fold.change) <- c("WT cerulenin")
+wt_treatment_ATG_fold.change.matrix <- as.matrix(wt_treatment_ATG_fold.change)
+wt_treatment_ATG$GeneID[wt_treatment_ATG$log2FoldChange >1 & wt_treatment_ATG$padj < 0.05]
+
+
+atg8_treatment_ATG <- as.data.frame(res_atg8) %>% rownames_to_column("GeneID")
+atg8_treatment_ATG <- atg8_treatment_ATG[atg8_treatment_ATG$GeneID %in% bar.phycodes_ATG,]
+atg8_treatment_ATG$GeneID <- ATG_markers$Name[match(atg8_treatment_ATG$GeneID,ATG_markers$PhyCode)]
+row.names(atg8_treatment_ATG) <- atg8_treatment_ATG$GeneID
+atg8_treatment_ATG_fold.change <- atg8_treatment_ATG[-c(1:2,4:7)]
+colnames(atg8_treatment_ATG_fold.change) <- c("atg8 cerulenin")
+atg8_treatment_ATG$GeneID[atg8_treatment_ATG$log2FoldChange >1 & atg8_treatment_ATG$padj < 0.05]
+
+atg8_treatment_ATG_fold.change.matrix <- as.matrix(atg8_treatment_ATG_fold.change)
+
+wt_atg8_treatment_ATG_fold.change.matrix <- cbind(wt_treatment_ATG_fold.change.matrix,
+                                              atg8_treatment_ATG_fold.change.matrix)
+# Transpose matrix:
+
+wt_atg8_treatment_ATG_fold.change.matrix <- t(wt_atg8_treatment_ATG_fold.change.matrix)
+
+# Remove columns where for both genotypes target ATG genes have log2 fold change < 1
+# and padj > 0.05
+
+# Colums to remove: VPS15, ATG5, ATG12, ATG9, ATG5, ATG6, ATG1, ATG18, ATG4
+
+wt_atg8_treatment_ATG_fold.change.matrix <- wt_atg8_treatment_ATG_fold.change.matrix[, -c(1,5,7:8,13:16)]
+wt_atg8_treatment_ATG_fold.change.matrix<-wt_atg8_treatment_ATG_fold.change.matrix[,order(colnames(wt_atg8_treatment_ATG_fold.change.matrix), decreasing = TRUE)]
+
+barplot(wt_atg8_treatment_ATG_fold.change.matrix, beside = TRUE,
+        legend.text = TRUE, ylab = "log2 fold change", ylim = c(0,12),
+        xpd = FALSE, cex.names = 0.5, col=colorRampPalette(rev(brewer.pal(2,"Blues")))(2))
+
+```
+
+### Chloroplast chaperones and stress markers
+
+```{r}
+
+bar.names_ChlStress <- Chloro_stress_markers$Name
+bar.phycodes_ChlStress <- Chloro_stress_markers$PhyCode
+
+wt_treatment_ChlStress <- as.data.frame(resWT) %>% rownames_to_column("GeneID")
+wt_treatment_ChlStress <- wt_treatment_ChlStress[wt_treatment_ChlStress$GeneID %in% bar.phycodes_ChlStress,]
+wt_treatment_ChlStress$GeneID <- Chloro_stress_markers$Name[match(wt_treatment_ChlStress$GeneID,
+                                                                  Chloro_stress_markers$PhyCode)]
+row.names(wt_treatment_ChlStress) <- wt_treatment_ChlStress$GeneID
+wt_treatment_ChlStress_fold.change <- wt_treatment_ChlStress[-c(1:2,4:7)]
+colnames(wt_treatment_ChlStress_fold.change) <- c("WT cerulenin")
+wt_treatment_ChlStress_fold.change.matrix <- as.matrix(wt_treatment_ChlStress_fold.change)
+wt_treatment_ChlStress$GeneID[wt_treatment_ChlStress$log2FoldChange >1 & wt_treatment_ChlStress$padj < 0.05]
+
+
+atg8_treatment_ChlStress <- as.data.frame(res_atg8) %>% rownames_to_column("GeneID")
+atg8_treatment_ChlStress <- atg8_treatment_ChlStress[atg8_treatment_ChlStress$GeneID %in% bar.phycodes_ChlStress,]
+atg8_treatment_ChlStress$GeneID <- Chloro_stress_markers$Name[match(atg8_treatment_ChlStress$GeneID,
+                                                                  Chloro_stress_markers$PhyCode)]
+row.names(atg8_treatment_ChlStress) <- atg8_treatment_ChlStress$GeneID
+atg8_treatment_ChlStress_fold.change <- atg8_treatment_ChlStress[-c(1:2,4:7)]
+colnames(atg8_treatment_ChlStress_fold.change) <- c("atg8 cerulenin")
+atg8_treatment_ChlStress$GeneID[atg8_treatment_ChlStress$log2FoldChange >1 & atg8_treatment_ChlStress$padj < 0.05]
+
+atg8_treatment_ChlStress_fold.change.matrix <- as.matrix(atg8_treatment_ChlStress_fold.change)
+
+wt_atg8_treatment_ChlStress_fold.change.matrix <- cbind(wt_treatment_ChlStress_fold.change.matrix,
+                                              atg8_treatment_ChlStress_fold.change.matrix)
+# Transpose matrix:
+
+wt_atg8_treatment_ChlStress_fold.change.matrix <- t(wt_atg8_treatment_ChlStress_fold.change.matrix)
+
+# Remove columns where for both genotypes target ATG genes have log2 fold change < 1
+# and padj > 0.05
+
+# Colums to remove: HSP22C, RPL37, CDJ2, CDJ1, CGE1, HSP70B, CDJ3, CLPS1, PRPS6, CLPS2
+
+wt_atg8_treatment_ChlStress_fold.change.matrix <- wt_atg8_treatment_ChlStress_fold.change.matrix[, -c(2:3, 5:10,12,14)]
+wt_atg8_treatment_ChlStress_fold.change.matrix<-wt_atg8_treatment_ChlStress_fold.change.matrix[,order(colnames(wt_atg8_treatment_ChlStress_fold.change.matrix), decreasing = TRUE)]
+
+barplot(wt_atg8_treatment_ChlStress_fold.change.matrix, beside = TRUE,
+        legend.text = TRUE, ylab = "log2 fold change", ylim = c(0,6),
+        xpd = FALSE, cex.names = 0.5, col=colorRampPalette(rev(brewer.pal(2,"Blues")))(2))
+
+```
+
+### Chloroplast redox markers
+
+```{r}
+
+bar.names_ChlRed <- Chloro_redox_markers$Name
+bar.phycodes_ChlRed <- Chloro_redox_markers$PhyCode
+
+wt_treatment_ChlRed <- as.data.frame(resWT) %>% rownames_to_column("GeneID")
+wt_treatment_ChlRed <- wt_treatment_ChlRed[wt_treatment_ChlRed$GeneID %in% bar.phycodes_ChlRed,]
+wt_treatment_ChlRed$GeneID <- Chloro_redox_markers$Name[match(wt_treatment_ChlRed$GeneID,
+                                                                  Chloro_redox_markers$PhyCode)]
+row.names(wt_treatment_ChlRed) <- wt_treatment_ChlRed$GeneID
+wt_treatment_ChlRed_fold.change <- wt_treatment_ChlRed[-c(1:2,4:7)]
+colnames(wt_treatment_ChlRed_fold.change) <- c("WT cerulenin")
+wt_treatment_ChlRed_fold.change.matrix <- as.matrix(wt_treatment_ChlRed_fold.change)
+wt_treatment_ChlRed$GeneID[wt_treatment_ChlRed$log2FoldChange >1 & wt_treatment_ChlRed$padj < 0.05]
+
+
+atg8_treatment_ChlRed <- as.data.frame(res_atg8) %>% rownames_to_column("GeneID")
+atg8_treatment_ChlRed <- atg8_treatment_ChlRed[atg8_treatment_ChlRed$GeneID %in% bar.phycodes_ChlRed,]
+atg8_treatment_ChlRed$GeneID <- Chloro_redox_markers$Name[match(atg8_treatment_ChlRed$GeneID,
+                                                                  Chloro_redox_markers$PhyCode)]
+row.names(atg8_treatment_ChlRed) <- atg8_treatment_ChlRed$GeneID
+atg8_treatment_ChlRed_fold.change <- atg8_treatment_ChlRed[-c(1:2,4:7)]
+colnames(atg8_treatment_ChlRed_fold.change) <- c("atg8 cerulenin")
+atg8_treatment_ChlRed$GeneID[atg8_treatment_ChlRed$log2FoldChange >1 & atg8_treatment_ChlRed$padj < 0.05]
+
+atg8_treatment_ChlRed_fold.change.matrix <- as.matrix(atg8_treatment_ChlRed_fold.change)
+
+wt_atg8_treatment_ChlRed_fold.change.matrix <- cbind(wt_treatment_ChlRed_fold.change.matrix,
+                                              atg8_treatment_ChlRed_fold.change.matrix)
+# Transpose matrix:
+
+wt_atg8_treatment_ChlRed_fold.change.matrix <- t(wt_atg8_treatment_ChlRed_fold.change.matrix)
+
+# Remove columns where for both genotypes target ATG genes have log2 fold change < 1
+# and padj > 0.05
+
+# Colums to remove: APX2, GRX3, PRX6, NTRC1
+
+wt_atg8_treatment_ChlRed_fold.change.matrix <- wt_atg8_treatment_ChlRed_fold.change.matrix[, -c(3:6)]
+wt_atg8_treatment_ChlRed_fold.change.matrix<-wt_atg8_treatment_ChlRed_fold.change.matrix[,order(colnames(wt_atg8_treatment_ChlRed_fold.change.matrix), decreasing = TRUE)]
+
+
+barplot(wt_atg8_treatment_ChlRed_fold.change.matrix, beside = TRUE,
+        legend.text = TRUE, ylab = "log2 fold change", ylim = c(0,6),
+        xpd = FALSE, cex.names = 0.5, col=colorRampPalette(rev(brewer.pal(2,"Blues")))(2))
+
+```
+
+
+## Difference between wild-type and mutant 0h
+
+### Gene obtention
+
+```{r}
+
+res_WT_atg8_0h = results(dds, contrast=c("genotype","atg8","wt"),
+                         cooksCutoff = FALSE, independentFiltering = FALSE)
+res_WT_atg8_0h
+
+log.fold.change_WT_atg8_0h <- res_WT_atg8_0h$log2FoldChange
+q.value_WT_atg8_0h <- res_WT_atg8_0h$padj
+names(log.fold.change_WT_atg8_0h) <- gene.ids
+names(q.value_WT_atg8_0h) <- gene.ids
+base.mean_WT_atg8_0h <- res_WT_atg8_0h$baseMean
+names(base.mean_WT_atg8_0h) <- gene.ids
+
+# Take a look at upregulated and downregulated genes: 
+
+top_20_overexpressed_genes_WT_atg8_0h <- res_WT_atg8_0h[order(res_WT_atg8_0h$log2FoldChange, decreasing = T),]
+kable(top_20_overexpressed_genes_WT_atg8_0h[1:20,-(3:4)])
+
+top_20_overrepressed_genes_WT_atg8_0h <- res_WT_atg8_0h[order(res_WT_atg8_0h$log2FoldChange, decreasing = F),]
+kable(top_20_overrepressed_genes_WT_atg8_0h[1:20,-(3:4)])
+
+activated.genes.deseq2_WT_atg8_0h <- gene.ids[log.fold.change_WT_atg8_0h > 1 & q.value_WT_atg8_0h < 0.05]
+activated.genes.deseq2_WT_atg8_0h <- activated.genes.deseq2_WT_atg8_0h[!is.na(activated.genes.deseq2_WT_atg8_0h)]
+activated.genes.deseq2_WT_atg8_0h_good <- substr(activated.genes.deseq2_WT_atg8_0h,1,nchar(activated.genes.deseq2_WT_atg8_0h)-5)
+write.table(activated.genes.deseq2_WT_atg8_0h_good,file="activated.genes.deseq2_WT_atg8_0h.txt",sep="\t",quote=F,row.names = F)
+
+repressed.genes.deseq2_WT_atg8_0h <- gene.ids[log.fold.change_WT_atg8_0h < -1 & q.value_WT_atg8_0h < 0.05]
+repressed.genes.deseq2_WT_atg8_0h <- repressed.genes.deseq2_WT_atg8_0h[!is.na(repressed.genes.deseq2_WT_atg8_0h)]
+repressed.genes.deseq2_WT_atg8_0h_good <- substr(repressed.genes.deseq2_WT_atg8_0h,1,nchar(repressed.genes.deseq2_WT_atg8_0h)-5)
+write.table(repressed.genes.deseq2_WT_atg8_0h_good,file="repressed.genes.deseq2_WT_atg8_0h.txt",sep="\t",quote=F,row.names = F)
+
+length(activated.genes.deseq2_WT_atg8_0h_good)
+length(repressed.genes.deseq2_WT_atg8_0h_good)
+
+```
+
+
+### MA plot
+
+```{r}
+
+plotMA(res_WT_atg8_0h,alpha=0.05, ylim=c(-30,30),colSig="grey")
+abline(h=c(-1,1), col="black", lwd=1)
+points(x = base.mean_WT_atg8_0h[activated.genes.deseq2_WT_atg8_0h],
+       y = log.fold.change_WT_atg8_0h[activated.genes.deseq2_WT_atg8_0h],col="red",cex=0.2,pch=19)
+points(x = base.mean_WT_atg8_0h[repressed.genes.deseq2_WT_atg8_0h],
+       y = log.fold.change_WT_atg8_0h[repressed.genes.deseq2_WT_atg8_0h],col="blue",cex=0.2,pch=19)
+
+text(x =100000, y = 15, label = length(activated.genes.deseq2_WT_atg8_0h_good),
+     col = "red", 
+     font = 2,    
+     cex = 1.5)   
+text(x =100000, y = -15, label = length(repressed.genes.deseq2_WT_atg8_0h_good),
+     col = "blue",  
+     font = 2,      
+     cex = 1.5)     
+legend("bottomright", legend = c("Overexpressed", "Repressed"),
+       lwd = 3, col = c("red", "blue"))
+
+```
+
+## Difference between wild-type and mutant 4h
+
+### Gene obtention
+
+```{r}
+
+res_WT_atg8_4h = results(dds, list( c("genotype_atg8_vs_wt","genotypeatg8.condition4h")),
+                                    cooksCutoff = FALSE, independentFiltering = FALSE )
+res_WT_atg8_4h
+
+log.fold.change_WT_atg8_4h <- res_WT_atg8_4h$log2FoldChange
+q.value_WT_atg8_4h <- res_WT_atg8_4h$padj
+names(log.fold.change_WT_atg8_4h) <- gene.ids
+names(q.value_WT_atg8_4h) <- gene.ids
+base.mean_WT_atg8_4h <- res_WT_atg8_4h$baseMean
+names(base.mean_WT_atg8_4h) <- gene.ids
+
+# Take a look at upregulated and downregulated genes: 
+
+top_20_overexpressed_genes_WT_atg8_4h <- res_WT_atg8_4h[order(res_WT_atg8_4h$log2FoldChange, decreasing = T),]
+kable(top_20_overexpressed_genes_WT_atg8_4h[1:20,-(3:4)])
+
+top_20_overrepressed_genes_WT_atg8_4h <- res_WT_atg8_4h[order(res_WT_atg8_4h$log2FoldChange, decreasing = F),]
+kable(top_20_overrepressed_genes_WT_atg8_4h[1:20,-(3:4)])
+
+activated.genes.deseq2_WT_atg8_4h <- gene.ids[log.fold.change_WT_atg8_4h > 1 & q.value_WT_atg8_4h < 0.05]
+activated.genes.deseq2_WT_atg8_4h <- activated.genes.deseq2_WT_atg8_4h[!is.na(activated.genes.deseq2_WT_atg8_4h)]
+activated.genes.deseq2_WT_atg8_4h_good <- substr(activated.genes.deseq2_WT_atg8_4h,1,nchar(activated.genes.deseq2_WT_atg8_4h)-5)
+write.table(activated.genes.deseq2_WT_atg8_4h_good,file="activated.genes.deseq2_WT_atg8_4h.txt",sep="\t",quote=F,row.names = F)
+
+
+repressed.genes.deseq2_WT_atg8_4h <- gene.ids[log.fold.change_WT_atg8_4h < -1 & q.value_WT_atg8_4h < 0.05]
+repressed.genes.deseq2_WT_atg8_4h <- repressed.genes.deseq2_WT_atg8_4h[!is.na(repressed.genes.deseq2_WT_atg8_4h)]
+repressed.genes.deseq2_WT_atg8_4h_good <- substr(repressed.genes.deseq2_WT_atg8_4h,1,nchar(repressed.genes.deseq2_WT_atg8_4h)-5)
+write.table(repressed.genes.deseq2_WT_atg8_4h_good,file="repressed.genes.deseq2_WT_atg8_4h.txt",sep="\t",quote=F,row.names = F)
+
+
+length(activated.genes.deseq2_WT_atg8_4h)
+length(repressed.genes.deseq2_WT_atg8_4h)
+
+```
+
+### MA plot
+
+```{r}
+
+plotMA(res_WT_atg8_4h, ylim=c(-30,30),colSig="grey")
+abline(h=c(-1,1), col="black", lwd=1)
+points(x = base.mean_WT_atg8_4h[activated.genes.deseq2_WT_atg8_4h],
+       y = log.fold.change_WT_atg8_4h[activated.genes.deseq2_WT_atg8_4h],col="red",cex=0.2,pch=19)
+points(x = base.mean_WT_atg8_4h[repressed.genes.deseq2_WT_atg8_4h],
+       y = log.fold.change_WT_atg8_4h[repressed.genes.deseq2_WT_atg8_4h],col="blue",cex=0.2,pch=19)
+
+text(x =100000, y = 15, label = length(activated.genes.deseq2_WT_atg8_4h_good),
+     col = "red",   
+     font = 2,      
+     cex = 1.5)     
+
+text(x =100000, y = -15, label = length(repressed.genes.deseq2_WT_atg8_4h_good),
+     col = "blue",
+     font = 2,    
+     cex = 1.5)   
+
+legend("bottomright", legend = c("Overexpressed", "Repressed"),
+       lwd = 3, col = c("red", "blue"))
+
+
+```
+
+## Different response for both genotypes (the interaction term)
+
+### Gene obtention
+
+```{r}
+
+res_interaction = results(dds, name="genotypeatg8.condition4h",
+                          cooksCutoff = FALSE, independentFiltering = FALSE)
+res_interaction
+
+log.fold.change_interaction <- res_interaction$log2FoldChange
+q.value_interaction <- res_interaction$padj
+names(log.fold.change_interaction) <- gene.ids
+names(q.value_interaction) <- gene.ids
+base.mean_interaction <- res_interaction$baseMean
+names(base.mean_interaction) <- gene.ids
+
+# Take a look at upregulated and downregulated genes: 
+
+top_20_overexpressed_genes_interaction <- res_interaction[order(res_interaction$log2FoldChange, decreasing = T),]
+kable(top_20_overexpressed_genes_interaction[1:20,-(3:4)])
+
+top_20_overrepressed_genes_interaction <- res_interaction[order(res_interaction$log2FoldChange, decreasing = F),]
+kable(top_20_overrepressed_genes_interaction[1:20,-(3:4)])
+
+activated.genes.deseq2_interaction <- gene.ids[log.fold.change_interaction > 1 & q.value_interaction < 0.05]
+activated.genes.deseq2_interaction <- activated.genes.deseq2_interaction[!is.na(activated.genes.deseq2_interaction)]
+activated.genes.deseq2_interaction_good <- substr(activated.genes.deseq2_interaction,1,nchar(activated.genes.deseq2_interaction)-5)
+write.table(activated.genes.deseq2_interaction_good,file="activated.genes.deseq2_interaction.txt",sep="\t",quote=F,row.names = F)
+
+
+repressed.genes.deseq2_interaction <- gene.ids[log.fold.change_interaction < -1 & q.value_interaction < 0.05]
+repressed.genes.deseq2_interaction <- repressed.genes.deseq2_interaction[!is.na(repressed.genes.deseq2_interaction)]
+repressed.genes.deseq2_interaction_good <- substr(repressed.genes.deseq2_interaction,1,nchar(repressed.genes.deseq2_interaction)-5)
+write.table(repressed.genes.deseq2_interaction_good,file="repressed.genes.deseq2_interaction.txt",sep="\t",quote=F,row.names = F)
+
+
+length(activated.genes.deseq2_interaction)
+length(repressed.genes.deseq2_interaction)
+
+```
+
+### MA plot
+
+```{r}
+
+plotMA(res_interaction, ylim=c(-30,30),colSig="grey")
+abline(h=c(-1,1), col="black", lwd=1)
+points(x = base.mean_interaction[activated.genes.deseq2_interaction],
+       y = log.fold.change_interaction[activated.genes.deseq2_interaction],col="red",cex=0.2,pch=19)
+points(x = base.mean_interaction[repressed.genes.deseq2_interaction],
+       y = log.fold.change_interaction[repressed.genes.deseq2_interaction],col="blue",cex=0.2,pch=19)
+
+text(x =100000, y = 15, label = length(activated.genes.deseq2_interaction_good),
+     col = "red",   
+     font = 2,      
+     cex = 1.5)     
+
+text(x =100000, y = -15, label = length(repressed.genes.deseq2_interaction_good),
+     col = "blue",  
+     font = 2,      
+     cex = 1.5)     
+
+legend("bottomright", legend = c("Overexpressed", "Repressed"),
+       lwd = 3, col = c("red", "blue"))
+
+
+```
+
+### Heatmap
+
+```{r, fig.width= 12, fig.height= 10}
+interaction_sigs <- res_interaction[res_interaction$padj < 0.05,]
+interaction_df <- as.data.frame(interaction_sigs)
+interaction_dftop <- interaction_df[interaction_df$baseMean > 50 & 
+                                    abs(interaction_df$log2FoldChange) > 1,]
+interaction_dftop <- interaction_dftop[order(interaction_dftop$log2FoldChange, decreasing=TRUE),]
+mat_int <- assay(vsd)[rownames(interaction_dftop), rownames(colData(vsd))]
+colnames(mat_int) <- rownames(colData(vsd))
+base_mean_int <- rowMeans(mat_int)
+mat_int_scaled <- t(apply(mat_int, 1,scale))
+colnames(mat_int_scaled) <- colnames(mat_int) # Original code, changed sample names in final figure
+num_keep <- 25
+rows_keep <- c(seq(1:num_keep), seq((nrow(mat_int_scaled)-num_keep),nrow(mat_int_scaled)))
+l2_val <- as.matrix(interaction_dftop[rows_keep,]$log2FoldChange)
+colnames(l2_val) <- "logFC"
+mean <- as.matrix(interaction_dftop[rows_keep,]$baseMean)
+colnames(mean) <- "AveExp"
+
+# maps values between b/w/r for min and max l2 values
+col_logFC <- colorRamp2(c(min(l2_val),0, max(l2_val)),c("blue", "white","red"))
+
+# maps between 0% quantile, and 75% quantile of mean values
+col_AveExpr <- colorRamp2(c(quantile(mean)[1],quantile(mean)[4]),c("white", "red"))
+
+ha <- HeatmapAnnotation(summary = anno_summary(gp=gpar(fill=2), height =unit(2, "cm")))
+
+h1 <- Heatmap(mat_int_scaled[rows_keep,],cluster_rows = F, column_labels = colnames(mat_int_scaled), name="Z-score", cluster_columns = T)
+
+h2 <- Heatmap(l2_val, row_labels = rownames(interaction_dftop[rows_keep,]), cluster_rows = F, name= "logFC", top_annotation = ha, col= col_logFC, cell_fun = function(j,i,x,y,w,h,col){
+  grid.text(round(l2_val[i,j],2),x,y)
+})
+
+h3 <- Heatmap(mean, row_labels = rownames(interaction_dftop[rows_keep,]), cluster_rows = F, name= "AveExpr", col = col_AveExpr, cell_fun = function(j,i,x,y,w,h,col){
+  grid.text(round(mean[i,j],2),x,y)
+})
+
+h <- h1+h2+h3
+h
+
+```
+
+
+## Are there any common genes between WT and atg8 the activated and/or repressed genes with treatment?
+
+### Venn Diagrams
+
+```{r}
+
+ven <- venndetail(list(WT_cerulenin= activated.genes.deseq2_WT_good, atg8_cerulenin=activated.genes.deseq2_atg8_good))
+plot(ven, order=FALSE)
+dplot(ven, order = TRUE, textsize = 2)
+plot(ven, type = "upset")
+
+```
+
+```{r}
+
+ven2 <- venndetail(list(WT_cerulenin= repressed.genes.deseq2_WT_good, atg8_cerulenin= repressed.genes.deseq2_atg8_good))
+plot(ven2, cat.cex=1, order=FALSE)
+dplot(ven2, order = TRUE, textsize = 2)
+plot(ven2, type = "upset")
+
+```
+
+### Lists of shared genes
+
+```{r}
+
+shared.activated <- result(ven)
+shared.activated_cerulenin <- shared.activated %>% filter(shared.activated$Subset=="Shared")
+shared.repressed <- result(ven2)
+shared.repressed_cerulenin <- shared.repressed %>% filter(shared.repressed$Subset=="Shared")
+
+```
+
+## Are there any common genes between WT and atg8 activated and/or repressed genes with and without treatment?
+
+### Venn Diagrams
+
+```{r}
+
+ven3 <- venndetail(list(WTvsatg8_0h= activated.genes.deseq2_WT_atg8_0h_good, WTvsatg8_4h=activated.genes.deseq2_WT_atg8_4h_good))
+plot(ven3)
+dplot(ven3, order = TRUE, textsize = 2)
+plot(ven3, type = "upset")
+
+```
+
+```{r}
+
+ven4 <- venndetail(list(WTvsatg8_0h= repressed.genes.deseq2_WT_atg8_0h_good, WTvsatg8_4h= repressed.genes.deseq2_WT_atg8_4h_good))
+plot(ven4)
+dplot(ven4, order = TRUE, textsize = 2)
+plot(ven4, type = "upset")
+
+```
+
+### Lists of shared genes
+
+```{r}
+
+shared.activated2 <- result(ven3)
+shared.activated_0h <- shared.activated2 %>% filter(shared.activated2$Subset=="Shared")
+shared.repressed2 <- result(ven4)
+shared.repressed_4h <- shared.repressed2 %>% filter(shared.repressed2$Subset=="Shared")
+
+```
