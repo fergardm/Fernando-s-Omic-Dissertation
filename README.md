@@ -13,4 +13,3 @@ In this repository, you'll find all the scripts, files and materials needed to r
 + DESeq2 analysis R Markdown script: a step by step guide to my *C. reinhardtii* differential expression analysis. It is also available in **.pdf** and **.html**. 
 
 
-![Workflow followed in this study](https://github.com/fergardm/Fernando-s-Omic-Dissertation/blob/main/Workflow_github.jpg)
